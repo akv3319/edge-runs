@@ -1,0 +1,32 @@
+name: explore
+# Runs one short python script (base64 in the input) on a hosted runner, to scope a site. Anything the
+# script writes under out/ comes back sealed (tar + AES-256 with the PN_ART_KEY secret) as the `out`
+# artifact, because a public repo's artifacts are downloadable by any signed-in user.
+on:
+  workflow_dispatch:
+    inputs:
+      code:
+        description: 'base64 of a python script'
+        required: true
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PN_ART_KEY: ${{ secrets.PN_ART_KEY }}
+    steps:
+      - name: Run
+        env:
+          CODE: ${{ inputs.code }}
+        run: |
+          python3 -m venv /tmp/v && /tmp/v/bin/pip install -q curl_cffi httpx
+          mkdir -p out && printf '%s' "$CODE" | base64 -d > /tmp/x.py && /tmp/v/bin/python /tmp/x.py > out/stdout.txt 2>&1 || echo "exit $?"
+      - name: Seal
+        if: always()
+        run: mkdir -p /tmp/seal && tar -cz out | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PN_ART_KEY -out /tmp/seal/data.enc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out
+          path: /tmp/seal/data.enc
+          retention-days: 3

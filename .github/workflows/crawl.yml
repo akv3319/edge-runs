@@ -1,0 +1,76 @@
+name: crawl
+# One resumable crawl job on a hosted runner. Starts from the previous run's sealed artifact, runs
+# crawl/sites/<site>.py for at most `minutes`, seals the output (tar + AES-256, key in the PN_ART_KEY
+# secret) and uploads it, then deletes the older artifact. Artifacts of a public repo are downloadable by
+# any signed-in user, so nothing leaves the runner unencrypted; no data is ever committed here.
+run-name: crawl ${{ inputs.site }}${{ inputs.part }}
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: 'crawler slug (crawl/sites/<slug>.py)'
+        required: true
+      minutes:
+        description: 'wall-clock budget in minutes'
+        required: false
+        default: '30'
+      args:
+        description: 'extra args for the crawler'
+        required: false
+        default: ''
+      part:
+        description: 'artifact suffix for a chunked job'
+        required: false
+        default: ''
+permissions:
+  contents: read
+  actions: write
+concurrency: crawl-${{ inputs.site }}
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PN_ART_KEY: ${{ secrets.PN_ART_KEY }}
+      SITE: ${{ inputs.site }}
+      ART: crawl-${{ inputs.site }}${{ inputs.part }}
+      PN_CRAWL_ROOT: ${{ github.workspace }}/pn-crawl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Previous artifact
+        run: |
+          test -n "$PN_ART_KEY" || { echo "PN_ART_KEY secret missing"; exit 1; }
+          mkdir -p "$PN_CRAWL_ROOT/$SITE" /tmp/prev
+          prev=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$ART&per_page=100" \
+            --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | "\(.id) \(.workflow_run.id)"')
+          if [ -n "$prev" ] && [ "$prev" != "null null" ]; then
+            gh run download "${prev#* }" -R "$GITHUB_REPOSITORY" -n "$ART" -D /tmp/prev
+            openssl enc -d -aes-256-cbc -pbkdf2 -pass env:PN_ART_KEY -in /tmp/prev/data.enc | tar -xz -C "$PN_CRAWL_ROOT/$SITE"
+            echo "PREV_ART=${prev%% *}" >> "$GITHUB_ENV"
+          fi
+          wc -l "$PN_CRAWL_ROOT/$SITE"/*.jsonl 2>/dev/null || true
+      - name: Crawl
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          ARGS: ${{ inputs.args }}
+        run: |
+          python3 -m venv /tmp/v && /tmp/v/bin/pip install -q curl_cffi
+          timeout --signal=INT --kill-after=60 "${MINUTES}m" /tmp/v/bin/python crawl/sites/$SITE.py $ARGS > /tmp/crawl.log 2>&1 || echo "crawler exit $?"
+          tail -c 2000 /tmp/crawl.log | grep -c . || true   # log stays on the runner; only its line count is printed
+          wc -l "$PN_CRAWL_ROOT/$SITE"/*.jsonl || true
+      - name: Seal
+        if: always()
+        run: |
+          mkdir -p /tmp/seal && cp /tmp/crawl.log "$PN_CRAWL_ROOT/$SITE/runner.log" 2>/dev/null || true
+          tar -cz -C "$PN_CRAWL_ROOT/$SITE" . | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PN_ART_KEY -out /tmp/seal/data.enc
+          ls -la /tmp/seal
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crawl-${{ inputs.site }}${{ inputs.part }}
+          path: /tmp/seal/data.enc
+          retention-days: 30
+      - name: Delete the older artifact
+        if: success() && env.PREV_ART != ''
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$PREV_ART"
