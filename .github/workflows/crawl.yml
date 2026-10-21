@@ -25,7 +25,9 @@ on:
 permissions:
   contents: read
   actions: write
-concurrency: crawl-${{ inputs.site }}
+# One job at a time per site; phdetail parts (one sitemap file each, own artifact) each get their own group so up
+# to ~20 run side by side, each at 1 req/s.
+concurrency: crawl-${{ inputs.site }}${{ inputs.site == 'phdetail' && inputs.part || '' }}
 jobs:
   crawl:
     runs-on: ubuntu-latest

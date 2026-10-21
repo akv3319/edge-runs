@@ -77,7 +77,7 @@ class Sink:
         vid = str(vid)
         if vid in self.done:
             return True
-        text = " ".join(str(norm.get(k) or "") for k in ("title", "description", "tags", "categories", "author"))
+        text = " ".join(str(norm.get(k) or "") for k in ("title", "description", "tags", "categories", "author", "pornstars"))
         for rule, rx in (("minors", MINOR), ("nonconsent", NONCONSENT)):
             m = rx.search(text)
             if m:
