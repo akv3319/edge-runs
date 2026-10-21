@@ -54,6 +54,8 @@ def parse(t):
     except ValueError:
         ld = None
     if not isinstance(ld, dict) or ld.get("@type") != "VideoObject":
+        if 'class="geoBlocked"' in t:  # 200 "This page is not available": the video's country deny list holds the US
+            return None, "geo: not available from the runner's country (US)"
         g = GONE.search(t)
         title = re.search(r"<title>(.*?)</title>", t, re.S)
         return None, (f"gone: {g[0]}" if g else "no ld+json") + f"; title={(title[1].strip() if title else '')[:80]}"
@@ -103,6 +105,7 @@ def parse(t):
         language=vd.get("language_spoken_in_video"), hd=vd.get("hd_video") == "Yes" if vd else None,
         vertical=str(fv.get("isVertical")) == "true" if fv else None, vr=bool(fv.get("isVR")) if fv else None,
         premium=vd.get("premium_video") == "Yes" if vd else None, video_id=flash.get("video_id"),
+        player=bool(fv),  # some pages (gay, uploader "unknown") carry no player config at all
     )
     return norm, raw
 
@@ -183,7 +186,7 @@ class Run:
             return self.sink.skip(k, f"redirected away ({final[:120]})")
         norm, raw = parse(t)
         if norm is None:
-            return self.sink.skip(k, raw) if raw.startswith("gone") else self.sink.error(k, raw)
+            return self.sink.skip(k, raw) if raw.startswith(("gone", "geo")) else self.sink.error(k, raw)
         self.rows += 1
         self.fill.update(f for f in FILL if norm.get(f) not in (None, [], ""))
         self.sink.item(k, url, raw, **norm)
@@ -244,6 +247,7 @@ def selfcheck(paths):
         print(p, {k: norm[k] for k in ("title", "duration", "views", "likes", "dislikes", "rating", "height", "production",
                                         "author", "author_type", "pornstars", "posted")}, len(norm["tags"]), "tags", len(norm["categories"]), "cats")
     assert parse("<html><title>Page Not Found</title></html>")[0] is None
+    assert parse('<div class="geoBlocked"> <h1> This page is not available </h1></div>')[1].startswith("geo")
     assert parse('<script type="application/ld+json">{"@type": "VideoObject", "name": "x", "duration": "PT00H01M02S"}</script>')[0]["duration"] == 62
     assert _iso_secs("PT00H03M05S") == 185 and _iso_secs("") is None
     print("ok: phdetail self-check passed")
