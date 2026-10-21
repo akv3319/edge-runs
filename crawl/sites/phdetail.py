@@ -18,9 +18,9 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import Sink, Stop
+from common import MINOR, NONCONSENT, Sink, Stop
 from _png_robots import RobotsFetcher
-from pornhub import BASE, arg_files
+from pornhub import BASE, arg_files, block
 
 LIMIT = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else None
 KIND = "shorties" if "--kind" in sys.argv and sys.argv[sys.argv.index("--kind") + 1] == "shorties" else "vids"
@@ -144,11 +144,28 @@ class Run:
         out, st, t = self.get(url, timeout=180)
         if out != "ok" or not t.rstrip().endswith("</urlset>"):
             raise Stop(f"{url}: {st}, not whole")
-        keys = re.findall(r"<loc>[^<]*(?:viewkey=|/shorties/)([A-Za-z0-9]+)</loc>", t)
-        self.parts[str(n)] = len(re.findall(r"<url>", t))
-        if len(keys) != self.parts[str(n)]:
-            raise Stop(f"{url}: {self.parts[str(n)]} urls but {len(keys)} viewkeys parsed")  # a short list is never silent
-        return keys
+        blocks = re.findall(r"<url>(.*?)</url>", t, re.S)
+        rows = {}
+        for b in blocks:
+            d = block(b)
+            m = re.search(r"(?:viewkey=|/shorties/)([A-Za-z0-9]+)", d["loc"])
+            if m:
+                rows[m[1]] = d
+        self.parts[str(n)] = len(blocks)
+        if len(rows) != len(blocks):
+            raise Stop(f"{url}: {len(blocks)} urls but {len(rows)} viewkeys parsed")  # a short list is never silent
+        return rows
+
+    def excluded_by_sitemap(self, k, sm):
+        """The sitemap's own title + uploader under the two rules the Dell import applied: such a page is never fetched."""
+        title = re.sub(r"\s*-\s*Porn Shortie\s*$", "", sm.get("title") or "")
+        for rule, rx in (("minors", MINOR), ("nonconsent", NONCONSENT)):
+            m = rx.search(f"{title} {sm.get('uploader') or ''}")
+            if m:
+                self.sink._append("excluded.jsonl", {"src": self.sink.site, "id": k, "rule": rule, "matched": m.group(0), "stage": "sitemap"})
+                self.sink.done.add(k)
+                return True
+        return False
 
     def save(self, **extra):
         return self.sink.progress(listed=len(self.ids), kind=KIND, files=self.parts, status=dict(self.status),
@@ -191,11 +208,13 @@ class Run:
 
     def main(self):
         try:
+            sm = {}
             for n in self.files:
-                self.ids += self.sitemap(n)
+                sm.update(self.sitemap(n))
+            self.ids = list(sm)
             self.sink.listed(self.ids)
             self.save(phase="listed")
-            todo = [k for k in dict.fromkeys(self.ids) if k not in self.sink.done]
+            todo = [k for k in self.ids if k not in self.sink.done and not self.excluded_by_sitemap(k, sm[k])]
             for i, k in enumerate(todo):
                 if LIMIT and i >= LIMIT:
                     break
@@ -207,7 +226,7 @@ class Run:
                     self.sink.error(k, repr(e))
                 if i % 100 == 0:
                     self.save(phase=f"{i} of {len(todo)} this run")
-            left = sum(k not in self.sink.done for k in dict.fromkeys(self.ids))
+            left = sum(k not in self.sink.done for k in self.ids)
             note = "done" if not left else f"{left} left (errors this run {self.sink.errors})"
             print(json.dumps(self.save(note=note if not LIMIT else f"limit {LIMIT}", left=left, live_check=self.live_check())))
         except (Stop, KeyboardInterrupt) as e:  # KeyboardInterrupt = crawl.yml's budget SIGINT; the next run resumes
