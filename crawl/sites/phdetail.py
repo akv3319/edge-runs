@@ -10,9 +10,10 @@ non-consent rules now see tags, categories and pornstars. 5 unreachable in a row
 403/429/challenge backs off 60-300 s and 10 in one run stop the job, so a block is never pushed through.
 
   python crawl/sites/phdetail.py --files 7-7 [--kind shorties] [--limit N]
+  python crawl/sites/phdetail.py --ids-enc <sealed list> (a cleanup run; see ids_arg)
 Self-check (parser on saved pages, nothing fetched): python3 crawl/sites/phdetail.py --selfcheck <page.html>...
 """
-import html, json, os, random, re, sys, time
+import base64, gzip, html, json, os, random, re, subprocess, sys, time
 from collections import Counter
 from datetime import datetime
 
@@ -56,6 +57,8 @@ def parse(t):
     if not isinstance(ld, dict) or ld.get("@type") != "VideoObject":
         if 'class="geoBlocked"' in t:  # 200 "This page is not available": the video's country deny list holds the US
             return None, "geo: not available from the runner's country (US)"
+        if "This video is unlisted" in t:  # the uploader hid it: noindex, and pornhub leaves the ld+json off
+            return None, "unlisted by the uploader (noindex, no ld+json)"
         g = GONE.search(t)
         title = re.search(r"<title>(.*?)</title>", t, re.S)
         return None, (f"gone: {g[0]}" if g else "no ld+json") + f"; title={(title[1].strip() if title else '')[:80]}"
@@ -110,11 +113,23 @@ def parse(t):
     return norm, raw
 
 
+def ids_arg():
+    """--ids-enc <base64>: viewkeys, one per line, gzipped and sealed with PN_ART_KEY like the artifacts, so a public
+    repo's run inputs never carry the list in clear. Seal on the Dell:
+      gzip -c ids.txt | PN_ART_KEY=$(cat ~/.pn_art_key) openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:PN_ART_KEY | base64 -w0"""
+    if "--ids-enc" not in sys.argv:
+        return None
+    blob = base64.b64decode(sys.argv[sys.argv.index("--ids-enc") + 1])
+    plain = subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-pass", "env:PN_ART_KEY"],
+                           input=blob, capture_output=True, check=True).stdout
+    return gzip.decompress(plain).decode().split()
+
+
 class Run:
     def __init__(self):
-        self.files = arg_files(None)
-        if not self.files:
-            raise SystemExit("--files A-B is required")
+        self.files, self.vkeys = arg_files(None), ids_arg()
+        if not self.files and self.vkeys is None:
+            raise SystemExit("--files A-B or --ids-enc is required")
         self.sink = Sink("phdetail")
         self.f = RobotsFetcher(self.sink, gap=float(os.environ.get("PH_GAP", "1.0")))  # no control: 5 bad in a row stops
         for c, v in [("age_verified", "1"), ("accessAgeDisclaimerPH", "1"), ("platform", "pc")]:
@@ -186,7 +201,7 @@ class Run:
             return self.sink.skip(k, f"redirected away ({final[:120]})")
         norm, raw = parse(t)
         if norm is None:
-            return self.sink.skip(k, raw) if raw.startswith(("gone", "geo")) else self.sink.error(k, raw)
+            return self.sink.skip(k, raw) if raw.startswith(("gone", "geo", "unlisted")) else self.sink.error(k, raw)
         self.rows += 1
         self.fill.update(f for f in FILL if norm.get(f) not in (None, [], ""))
         self.sink.item(k, url, raw, **norm)
@@ -212,8 +227,11 @@ class Run:
     def main(self):
         try:
             sm = {}
-            for n in self.files:
+            for n in self.files or ():
                 sm.update(self.sitemap(n))
+            if self.vkeys is not None:  # cleanup run: listing ids no sitemap part read; screened on the Dell, so no sitemap row
+                sm.update({k: {} for k in self.vkeys})
+                self.parts["ids"] = len(self.vkeys)
             self.ids = list(sm)
             self.sink.listed(self.ids)
             self.save(phase="listed")
@@ -250,7 +268,63 @@ def selfcheck(paths):
     assert parse('<div class="geoBlocked"> <h1> This page is not available </h1></div>')[1].startswith("geo")
     assert parse('<script type="application/ld+json">{"@type": "VideoObject", "name": "x", "duration": "PT00H01M02S"}</script>')[0]["duration"] == 62
     assert _iso_secs("PT00H03M05S") == 185 and _iso_secs("") is None
+    crawl_stub()
     print("ok: phdetail self-check passed")
+
+
+def crawl_stub():
+    """Run().main() against a local stand-in for pornhub: robots, one sitemap, a watch page and an unlisted one."""
+    import http.server, tempfile, threading
+    import common
+    global BASE
+    common.ROOT = tempfile.mkdtemp()
+    pages = {
+        "/robots.txt": "User-agent: *\nAllow: /\n",
+        "/sitemap_g_vids1.xml": "<urlset>" + "".join(f"<url><loc>{{b}}/view_video.php?viewkey={k}</loc><video:video><video:title>t {k}"
+                                                       f"</video:title></video:video></url>" for k in ("good1", "unl1")) + "</urlset>",
+        "/view_video.php?viewkey=good1": '<title>t good1</title><script type="application/ld+json">{"@type": "VideoObject", "name": "t good1"}</script>',
+        "/view_video.php?viewkey=unl1": '<title>t unl1 - Pornhub.com</title><meta name="robots" content="noindex, follow" />'
+                                        '<span class="notifMessage"> This video is unlisted. Only those with a link can see it. </span>',
+    }
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = pages.get(self.path)
+            self.send_response(200 if body else 404)
+            self.end_headers()
+            self.wfile.write((body or "").replace("{b}", BASE).encode())
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    BASE, argv = f"http://127.0.0.1:{srv.server_port}", sys.argv[:]
+    os.environ["PH_GAP"], sys.argv[1:] = "0", ["--files", "1-1"]
+    try:
+        r = Run()
+        r.main()
+    finally:
+        sys.argv[:] = argv
+        srv.shutdown()
+    skipped = [json.loads(l) for l in open(os.path.join(r.sink.dir, "skipped.jsonl"))]
+    assert [s["id"] for s in skipped] == ["unl1"] and skipped[0]["reason"].startswith("unlisted"), skipped
+    assert r.sink.done == {"good1", "unl1"} and not r.sink.errors, "an unlisted video is a named skip, not an error"
+    import gzip, subprocess
+    os.environ["PN_ART_KEY"], common.ROOT = "00" * 32, tempfile.mkdtemp()  # own sink: the live check re-asks stored rows
+    blob = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", "env:PN_ART_KEY"],
+                          input=gzip.compress(b"good2\ngone1\n"), capture_output=True, check=True).stdout
+    pages["/view_video.php?viewkey=good2"] = '<title>t good2</title><script type="application/ld+json">{"@type": "VideoObject", "name": "t good2"}</script>'
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    BASE, sys.argv[1:] = f"http://127.0.0.1:{srv.server_port}", ["--ids-enc", base64.b64encode(blob).decode()]
+    try:
+        r = Run()
+        r.main()
+    finally:
+        sys.argv[:] = argv
+        srv.shutdown()
+    assert [json.loads(l)["id"] for l in open(os.path.join(r.sink.dir, "listing.jsonl"))] == ["good2", "gone1"], "an ids run lists the given ids"
+    assert {"good2", "gone1"} <= r.sink.done and not r.sink.errors, "a sealed id list is fetched with no sitemap; a 404 is a named skip"
 
 
 if __name__ == "__main__":
